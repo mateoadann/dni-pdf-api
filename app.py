@@ -7,8 +7,8 @@ import cv2
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import Response
 
-from image_processor import process_image_to_document
-from pdf_maker import create_single_page_pdf_bytes
+from image_processor import process_image_to_documents
+from pdf_maker import create_single_page_pdf_bytes    
 
 app = FastAPI(title="Image Processor API")
 
@@ -17,20 +17,23 @@ app = FastAPI(title="Image Processor API")
 def health():
     return {"status": "ok"}
 
+MAX_DOCS = 6          # ← máximo de documentos por PDF
+MAX_FILES = 4         # ← máximo de imágenes subidas (si querés lo podés cambiar)
 
 @app.post("/dni-pdf")
 async def dni_pdf(files: List[UploadFile] = File(...)):
     """
     Recibe entre 1 y 4 imágenes (JPG/PNG) y devuelve
-    un PDF A4 de 1 hoja con todas las imágenes procesadas.
+    un PDF A4 de 1 hoja con hasta 6 documentos procesados.
+    Puede detectar varios documentos en una misma foto.
     """
     if not files:
         raise HTTPException(status_code=400, detail="Debes enviar al menos una imagen")
 
-    if len(files) > 4:
-        raise HTTPException(status_code=400, detail="Máximo 4 imágenes por PDF")
+    if len(files) > MAX_FILES:
+        raise HTTPException(status_code=400, detail=f"Máximo {MAX_FILES} imágenes por PDF")
 
-    processed_images = []
+    processed_images: list[np.ndarray] = []
 
     for f in files:
         if f.content_type not in ("image/jpeg", "image/png", "image/jpg"):
@@ -44,20 +47,41 @@ async def dni_pdf(files: List[UploadFile] = File(...)):
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
-            raise HTTPException(status_code=400, detail=f"No se pudo leer la imagen {f.filename}")
+            raise HTTPException(
+                status_code=400, detail=f"No se pudo leer la imagen {f.filename}"
+            )
+
+        # ¿cuántos documentos más podemos agregar?
+        docs_left = MAX_DOCS - len(processed_images)
+        if docs_left <= 0:
+            break   # ya estamos en el límite: 5
 
         try:
-            doc_img = process_image_to_document(
+            docs = process_image_to_documents(
                 img,
-                debug=False,
+                debug=False,           # en producción
+                debug_prefix="",
                 margin_ratio=0.06,
                 rotate_portrait=True,
-                enhance_mode="soft",  # o "hard" si querés blanco/negro tipo fotocopia
+                max_docs=docs_left,
             )
         except ValueError as e:
-            raise HTTPException(status_code=422, detail=str(e))
+            # no encontró documentos válidos en esta imagen
+            continue
 
-        processed_images.append(doc_img)
+        for d in docs:
+            processed_images.append(d)
+            if len(processed_images) >= MAX_DOCS:
+                break
+
+        if len(processed_images) >= MAX_DOCS:
+            break
+
+    if not processed_images:
+        raise HTTPException(status_code=422, detail="No se pudo extraer ningún documento")
+
+    # DEBUG opcional: verificar cuántos docs realmente se van al PDF
+    print(f"[API] Documentos que irán al PDF: {len(processed_images)}")
 
     try:
         pdf_bytes = create_single_page_pdf_bytes(
@@ -65,10 +89,10 @@ async def dni_pdf(files: List[UploadFile] = File(...)):
             dpi=300,
             outer_margin_mm=8.0,
             inner_margin_mm_x=8.0,
-            inner_margin_mm_y=3.0,
-            grid_rows=2,
-            grid_cols=2,
-            grid_height_fraction=0.7,
+            inner_margin_mm_y=1.0,
+            grid_rows=3,   # 3 filas
+            grid_cols=2,   # 2 columnas → hasta 6 slots, usamos máx. 6
+            grid_height_fraction=0.8,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al generar el PDF: {e}")

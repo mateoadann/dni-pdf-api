@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-
+from typing import List
 
 def order_points(pts: np.ndarray) -> np.ndarray:
     """
@@ -74,7 +74,6 @@ def find_document_contour(edged: np.ndarray, min_area: float = 5000) -> np.ndarr
             return approx.reshape(4, 2)
 
     return None
-
 
 def process_image_to_document(
     image_bgr: np.ndarray,
@@ -157,8 +156,130 @@ def process_image_to_document(
         value=(255, 255, 255),
     )
 
-    # 7. Rotar a portrait (forzado si querés)
-    if rotate_portrait:
-        warped_padded = cv2.rotate(warped_padded, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    # 7. Rotar a landscape (tarjeta acostada)
+    if rotate_portrait:  # o rotate_landscape
+        h, w = warped_padded.shape[:2]
+        if h > w:
+            warped_padded = cv2.rotate(
+                warped_padded,
+                cv2.ROTATE_90_CLOCKWISE,
+            )
 
     return warped_padded
+
+def process_image_to_documents(
+    image_bgr: np.ndarray,
+    debug: bool = False,
+    debug_prefix: str = "",       # NUEVO
+    margin_ratio: float = 0.06,
+    rotate_portrait: bool = True,
+    max_docs: int = 6,
+) -> List[np.ndarray]:
+    """
+    Procesa una imagen que puede contener 1 o más documentos.
+    Devuelve una lista de imágenes BGR, una por documento detectado.
+
+    - max_docs: máximo de documentos a devolver (por ej. 4 para tu PDF 2x2).
+    """
+
+    # 1) Redimensionar (igual que en process_image_to_document)
+    orig = image_bgr.copy()
+    orig_h, orig_w = orig.shape[:2]
+    max_dim = 1000
+
+    scale = 1.0
+    if max(orig_h, orig_w) > max_dim:
+        scale = max_dim / float(max(orig_h, orig_w))
+        image_bgr = cv2.resize(
+            image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+        )
+
+    # 2) Preprocesado: gris + blur + Canny
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(gray, 50, 150)
+
+    if debug:
+        cv2.imwrite(f"{debug_prefix}debug_edges_multi.jpg", edged)
+
+    # 3) Buscar TODOS los contornos tipo rectángulo
+    contours, _ = cv2.findContours(
+        edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    h, w = edged.shape[:2]
+    min_area_ratio = 0.05  # 5% del área total como mínimo
+    min_area = min_area_ratio * h * w
+
+    candidates = []
+
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+
+        # Solo cuadriláteros
+        if len(approx) == 4:
+            area = cv2.contourArea(approx)
+            if area >= min_area:
+                candidates.append((area, approx.reshape(4, 2)))
+
+    # Ordenar por área (más grande primero) y limitar a max_docs
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates = candidates[:max_docs]
+
+    if not candidates:
+        raise ValueError("No se encontraron documentos en la imagen")
+
+    processed_images: List[np.ndarray] = []
+
+    for idx, (_, cnt) in enumerate(candidates):
+        if idx >= max_docs:
+            break
+
+        doc_contour = cnt / scale
+
+        if debug:
+            dbg = orig.copy()
+            cv2.drawContours(dbg, [doc_contour.astype(int)], -1, (0, 255, 0), 3)
+            cv2.imwrite(
+                f"{debug_prefix}debug_contour_doc_{idx+1}.jpg",
+                dbg,
+            )
+        # === A partir de acá copiamos la misma lógica de process_image_to_document ===
+
+        # Corrección de perspectiva
+        warped = four_point_transform(orig, doc_contour.astype("float32"))
+
+        # Mejora de contraste (igual que tu función actual)
+        warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        warped_eq = cv2.equalizeHist(warped_gray)
+        warped_final = cv2.cvtColor(warped_eq, cv2.COLOR_GRAY2BGR)
+
+        # Margen blanco
+        hh, ww = warped_final.shape[:2]
+        base = min(hh, ww)
+        pad = int(base * margin_ratio)
+
+        warped_padded = cv2.copyMakeBorder(
+            warped_final,
+            pad,
+            pad,
+            pad,
+            pad,
+            borderType=cv2.BORDER_CONSTANT,
+            value=(255, 255, 255),
+        )
+
+        # Rotar a landscape (tarjeta acostada) si hace falta
+        if rotate_portrait:  # o renombrá el parámetro a rotate_landscape
+            h, w = warped_padded.shape[:2]
+            if h > w:
+                # Si está vertical (alto > ancho), la acostamos
+                warped_padded = cv2.rotate(
+                    warped_padded,
+                    cv2.ROTATE_90_COUNTERCLOCKWISE,
+                )
+
+        processed_images.append(warped_padded)
+
+    return processed_images
